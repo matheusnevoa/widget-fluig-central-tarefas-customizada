@@ -9,7 +9,10 @@ var Central_de_tarefas = SuperWidget.extend({
     carouselIndex: 0,
 
     // === Fase 0: instrumentação opt-in de performance ===
-    // Ativar manualmente no console: Central_de_tarefas.instance().debugPerf = true; (e recarregar widget)
+    // Para ATIVAR em homologação (cobre o init na próxima recarga):
+    //   localStorage.setItem('CentralTarefas.debugPerf', 'true');  // depois recarregar
+    // Para DESATIVAR:
+    //   localStorage.removeItem('CentralTarefas.debugPerf');       // depois recarregar
     // Quando OFF (default), helpers viram no-op — zero overhead em produção.
     debugPerf: false,
     _perfCounters: null,
@@ -43,6 +46,16 @@ var Central_de_tarefas = SuperWidget.extend({
     // Widget initialization
     init: function() {
         var instance = this;
+
+        // debugPerf precisa ser lido ANTES de qualquer medição para cobrir o init().
+        // Atribuição no console (Central_de_tarefas.instance().debugPerf = true) não
+        // sobrevive a reload — por isso usamos localStorage como fonte persistente.
+        try {
+            if (typeof localStorage !== 'undefined' && localStorage.getItem('CentralTarefas.debugPerf') === 'true') {
+                instance.debugPerf = true;
+            }
+        } catch (e) { /* localStorage pode estar bloqueado (modo privado, sandbox) */ }
+
         instance._perfCounters = {};
         var _initT0 = instance._perfNow();
 
