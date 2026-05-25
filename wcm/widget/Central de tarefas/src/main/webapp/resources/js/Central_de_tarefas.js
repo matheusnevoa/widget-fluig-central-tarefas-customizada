@@ -14,6 +14,10 @@ var Central_de_tarefas = SuperWidget.extend({
     debugPerf: false,
     _perfCounters: null,
 
+    // Cache de atividades por processId (preenchido pelo getProcessActivities).
+    // Vive durante a sessão da instância — atividades de processo não mudam em runtime.
+    _processStateCache: null,
+
     _perfNow: function() {
         return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     },
@@ -45,6 +49,7 @@ var Central_de_tarefas = SuperWidget.extend({
         // Estado por instância (objetos não podem ficar no protótipo)
         instance.filters = { solicitante: 'all', responsavel: 'all', categoria: 'all' };
         instance.colleagueMap = {};
+        instance._processStateCache = {};
 
         // Hide containers initially
         $('#carousel-section-' + instance.instanceId).addClass('d-none');
@@ -980,6 +985,14 @@ var Central_de_tarefas = SuperWidget.extend({
     // Helper to get workflow activity list
     getProcessActivities: function(processId) {
         var instance = this;
+
+        // Cache hit — evita chamada do dataset processState a cada renderKanban/selectProcess.
+        // Atividades de um processo são estruturais (diagrama BPM) e não mudam em runtime.
+        if (instance._processStateCache && instance._processStateCache.hasOwnProperty(processId)) {
+            instance._perfCount('processState.cacheHit');
+            return instance._processStateCache[processId];
+        }
+
         var activities = [];
 
         // 1. Tenta buscar do Fluig se estiver no ambiente usando o dataset processState
@@ -1046,6 +1059,11 @@ var Central_de_tarefas = SuperWidget.extend({
                 }
             });
             activities = acts;
+        }
+
+        // Memoiza por processId (incluindo array vazio — consistência entre chamadas).
+        if (instance._processStateCache) {
+            instance._processStateCache[processId] = activities;
         }
 
         return activities;
