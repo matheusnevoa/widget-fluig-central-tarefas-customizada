@@ -722,20 +722,36 @@ var Central_de_tarefas = SuperWidget.extend({
         var root = $('#Central_de_tarefas_' + instance.instanceId);
 
         // --- SOLICITANTES ---
+        // value = requesterId (chave técnica, estável); label = nome resolvido (apresentação).
+        // Desacopla apresentação de regra de filtro — evita colisão por homônimos e
+        // sobrevive a mudança de label depois de uma resolução tardia.
         var solicitantes = {};
+        var hasNoRequesterId = false;
         instance.requests.forEach(function(r) {
-            if (r.requester) solicitantes[r.requester] = true;
+            if (r.requesterId) {
+                // Mantém a melhor label conhecida (já passou por resolveRequesterNames)
+                if (!solicitantes[r.requesterId]) {
+                    solicitantes[r.requesterId] = r.requester || r.requesterId;
+                }
+            } else {
+                hasNoRequesterId = true;
+            }
         });
-        var solicitantesArr = Object.keys(solicitantes).sort(function(a, b) {
-            return a.localeCompare(b, 'pt-BR');
+        var solicitantesArr = Object.keys(solicitantes).map(function(id) {
+            return { id: id, label: solicitantes[id] };
+        }).sort(function(a, b) {
+            return a.label.localeCompare(b.label, 'pt-BR');
         });
 
         var $solSelect = root.find('#filter-solicitante-' + instance.instanceId);
         $solSelect.empty();
         $solSelect.append('<option value="all">Todos</option>');
         solicitantesArr.forEach(function(s) {
-            $solSelect.append('<option value="' + instance.escapeHtml(s) + '">' + instance.escapeHtml(s) + '</option>');
+            $solSelect.append('<option value="' + instance.escapeHtml(s.id) + '">' + instance.escapeHtml(s.label) + '</option>');
         });
+        if (hasNoRequesterId) {
+            $solSelect.append('<option value="__no_requester__">Sem solicitante</option>');
+        }
 
         // --- RESPONSÁVEIS ---
         var responsaveis = {};
@@ -848,9 +864,14 @@ var Central_de_tarefas = SuperWidget.extend({
         var instance = this;
         var f = instance.filters;
         return instance.requests.filter(function(req) {
-            // Solicitante
+            // Solicitante — compara por requesterId (chave técnica), não por label visual.
+            // value especial '__no_requester__' filtra solicitações sem requesterId.
             if (f.solicitante !== 'all') {
-                if ((req.requester || '') !== f.solicitante) return false;
+                if (f.solicitante === '__no_requester__') {
+                    if (req.requesterId) return false;
+                } else {
+                    if (req.requesterId !== f.solicitante) return false;
+                }
             }
             // Responsável
             if (f.responsavel !== 'all') {
@@ -897,10 +918,19 @@ var Central_de_tarefas = SuperWidget.extend({
         var chips = [];
 
         if (instance.filters.solicitante !== 'all') {
+            var solValue = instance.filters.solicitante;
+            var solLabel;
+            if (solValue === '__no_requester__') {
+                solLabel = 'Sem solicitante';
+            } else {
+                // Procura o primeiro request com este requesterId para obter o label resolvido
+                var match = instance.requests.find(function(r) { return r.requesterId === solValue; });
+                solLabel = (match && match.requester) || instance.colleagueMap[solValue] || solValue;
+            }
             chips.push({
                 key: 'solicitante',
                 label: 'Solicitante',
-                value: instance.filters.solicitante
+                value: solLabel
             });
         }
         if (instance.filters.responsavel !== 'all') {
