@@ -300,6 +300,9 @@ var Central_de_tarefas = SuperWidget.extend({
     // Retrieve and join Fluig Datasets
     getFluigData: function() {
         var data = [];
+        // Escopo pessoal: widget mostra apenas itens onde o usuário logado tem tarefa
+        // ativa OU é o requester. Se loggedUser indisponível, mantém comportamento legado (sem filtro).
+        var loggedUser = this.getLoggedUser();
         try {
             // Get all workflow instances
             var constraintsWorkflow = [];
@@ -308,9 +311,15 @@ var Central_de_tarefas = SuperWidget.extend({
             var dsWorkflow = DatasetFactory.getDataset("workflowProcess", null, constraintsWorkflow, null);
             if (dsWorkflow && dsWorkflow.values && dsWorkflow.values.length > 0) {
 
-                // Get active tasks to find current activity name, deadlines and assignees
+                // Get active tasks to find current activity name, deadlines and assignees.
+                // Constraint MATRICULA reduz drasticamente o payload quando loggedUser está disponível
+                // (ds_process_task suporta o bind — ver datasets/ds_process_task.js).
+                var dsTasksConstraints = null;
+                if (loggedUser) {
+                    dsTasksConstraints = [DatasetFactory.createConstraint("MATRICULA", loggedUser, loggedUser, ConstraintType.MUST)];
+                }
                 this._perfCount('dataset.ds_process_task');
-                var dsTasks = DatasetFactory.getDataset("ds_process_task", null, null, null);
+                var dsTasks = DatasetFactory.getDataset("ds_process_task", null, dsTasksConstraints, null);
                 var activeTaskMap = {};
 
                 if (dsTasks && dsTasks.values) {
@@ -347,13 +356,26 @@ var Central_de_tarefas = SuperWidget.extend({
                     }
                 }
 
+                // Reduz dsWorkflow.values aos itens do usuário ANTES de buildDescriptorMap.
+                // Isso encolhe drasticamente o N+1 do dataset 'document', porque só pedimos
+                // descriptor para solicitações que de fato serão exibidas.
+                var workflowValues = dsWorkflow.values;
+                if (loggedUser) {
+                    workflowValues = dsWorkflow.values.filter(function(w) {
+                        var iid = w.processInstanceId || w["workflowProcessPK.processInstanceId"];
+                        var hasUserTask = activeTaskMap[iid] && activeTaskMap[iid].length > 0;
+                        var isUserRequester = w.requesterId === loggedUser;
+                        return hasUserTask || isUserRequester;
+                    });
+                }
+
                 // Mapa cardDocumentId → descriptor textual do registro de formulário.
                 // Prioridade do texto: documentDescription → cardDescription.
                 // Seleção de versão: activeVersion === true; fallback = maior documentPK.version.
-                var descriptorMap = this.buildDescriptorMap(dsWorkflow.values);
+                var descriptorMap = this.buildDescriptorMap(workflowValues);
 
-                for (var i = 0; i < dsWorkflow.values.length; i++) {
-                    var w = dsWorkflow.values[i];
+                for (var i = 0; i < workflowValues.length; i++) {
+                    var w = workflowValues[i];
                     var instanceId = w.processInstanceId || w["workflowProcessPK.processInstanceId"];
                     var procId = w.processId;
 
