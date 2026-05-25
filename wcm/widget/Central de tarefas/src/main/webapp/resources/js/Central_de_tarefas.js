@@ -587,6 +587,45 @@ var Central_de_tarefas = SuperWidget.extend({
                 // Silencioso — falha em uma resolução não deve travar o widget
             }
         });
+
+        // Resolução residual de SOLICITANTES (requesterId).
+        // O caminho otimizado usa req.requesterName direto (sem chamada extra). Em
+        // ambientes Identity, requesterName costuma vir vazio OU igual ao hash do id —
+        // nesses casos caímos no fallback que exibe o hash na tela. Aqui detectamos
+        // esses casos e fazemos uma 2ª passada no dataset 'colleague' para resolver o
+        // nome real. IDs já presentes em colleagueMap (resolvidos como responsáveis)
+        // não são re-buscados.
+        var residualIds = {};
+        instance.requests.forEach(function(req) {
+            var rid = req.requesterId;
+            if (!rid) return;
+            if (instance.colleagueMap[rid]) return; // já resolvido
+            // Sinais de "nome técnico":
+            //   - requesterName ausente/null
+            //   - requesterName igual ao id (típico de Identity)
+            //   - requesterName parece hash (32 chars hex)
+            var rname = req.requesterName;
+            var looksTechnical = !rname
+                || rname === rid
+                || (typeof rname === 'string' && /^[0-9a-f]{32}$/i.test(rname));
+            if (looksTechnical) {
+                residualIds[rid] = true;
+            }
+        });
+        var residual = Object.keys(residualIds);
+        if (residual.length > 0) {
+            residual.forEach(function(id) {
+                try {
+                    var c1 = DatasetFactory.createConstraint("colleaguePK.colleagueId", id, id, ConstraintType.MUST);
+                    instance._perfCount('dataset.colleague.requester');
+                    var ds = DatasetFactory.getDataset("colleague", null, [c1], null);
+                    if (ds && ds.values && ds.values.length > 0) {
+                        var c = ds.values[0];
+                        instance.colleagueMap[id] = c.colleagueName || c.fullName || id;
+                    }
+                } catch (e) { /* silencioso */ }
+            });
+        }
     },
 
     // Resolve o descriptor (texto descritivo da solicitação) a partir do dataset 'document'.
