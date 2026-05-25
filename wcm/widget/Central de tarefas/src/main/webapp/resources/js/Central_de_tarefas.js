@@ -310,8 +310,28 @@ var Central_de_tarefas = SuperWidget.extend({
             // alguns navegadores podem bloquear escrita no about:blank — segue sem loader
         }
 
+        // Timeout de segurança: se a chamada REST pendurar (rede lenta, servidor sem
+        // resposta, SDK que não dispara success/error), evita deixar a aba presa em
+        // "Abrindo solicitação…" indefinidamente — força navegação para o fallbackUrl.
+        var resolved = false;
+        var navigateTo = function(targetUrl) {
+            if (resolved) return;
+            resolved = true;
+            try {
+                win.location.href = targetUrl;
+            } catch (eNav) {
+                console.error("Não foi possível navegar a janela para a solicitação:", eNav);
+            }
+        };
+        var timeoutHandle = setTimeout(function() {
+            if (resolved) return;
+            console.warn("[CentralTarefas] Timeout (15s) ao buscar contexto da tarefa — abrindo tela de detalhes em fallback.");
+            navigateTo(fallbackUrl);
+        }, 15000);
+
         // Resolve contexto da tarefa e atualiza a janela com a URL final
         instance.fetchUserTaskContextAsync(task.processId, task.processInstanceId, function(ctx) {
+            clearTimeout(timeoutHandle);
             var finalUrl;
             if (ctx && ctx.movementSequence && ctx.assigneeCode) {
                 finalUrl = base
@@ -322,11 +342,7 @@ var Central_de_tarefas = SuperWidget.extend({
             } else {
                 finalUrl = fallbackUrl;
             }
-            try {
-                win.location.href = finalUrl;
-            } catch (eNav) {
-                console.error("Não foi possível navegar a janela para a solicitação:", eNav);
-            }
+            navigateTo(finalUrl);
         });
     },
 
