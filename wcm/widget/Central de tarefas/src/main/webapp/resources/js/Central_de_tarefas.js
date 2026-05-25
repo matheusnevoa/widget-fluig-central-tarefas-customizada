@@ -172,13 +172,15 @@ var Central_de_tarefas = SuperWidget.extend({
         return null;
     },
 
-    // Busca as tarefas ativas de uma solicitação via REST.
-    // Retorna { movementSequence, assigneeCode } da tarefa do usuário logado, ou null.
-    fetchUserTaskContext: function(processId, processInstanceId) {
-        if (!processId || !processInstanceId) return null;
+    // Busca assíncrona as tarefas ativas de uma solicitação via REST.
+    // Invoca callback com { movementSequence, assigneeCode } da tarefa do usuário logado,
+    // ou null se não encontrar / falhar. NÃO bloqueia a UI.
+    fetchUserTaskContextAsync: function(processId, processInstanceId, callback) {
+        var instance = this;
+        if (!processId || !processInstanceId) return callback(null);
 
-        var loggedUser = this.getLoggedUser();
-        if (!loggedUser) return null;
+        var loggedUser = instance.getLoggedUser();
+        if (!loggedUser) return callback(null);
 
         var serverURL = WCMAPI.serverURL || (WCMAPI.getServerURL && WCMAPI.getServerURL()) || '';
         var url = serverURL
@@ -188,23 +190,23 @@ var Central_de_tarefas = SuperWidget.extend({
         var requestFn = (typeof FLUIGC !== 'undefined' && FLUIGC.ajax)
             ? FLUIGC.ajax
             : (typeof $ !== 'undefined' && $.ajax ? $.ajax : null);
-        if (!requestFn) return null;
+        if (!requestFn) return callback(null);
 
-        this._perfCount('ajax.requests-tasks');
-        var _ajaxT0 = this._perfNow();
-        var _debugPerf = this.debugPerf;
-        var _perfNow = this._perfNow;
+        instance._perfCount('ajax.requests-tasks');
+        var _t0 = instance._perfNow();
 
-        var context = null;
         try {
             requestFn({
                 dataType: 'json',
                 url: url,
                 type: 'GET',
                 contentType: 'application/json',
-                async: false,
+                async: true,
                 loading: false,
                 success: function(result) {
+                    if (instance.debugPerf) {
+                        console.log('[CentralTarefas][perf] ajax.requests-tasks: ' + Math.round(instance._perfNow() - _t0) + 'ms');
+                    }
                     var items = (result && result.items) ? result.items : [];
                     var userTasks = [];
                     for (var i = 0; i < items.length; i++) {
@@ -214,7 +216,7 @@ var Central_de_tarefas = SuperWidget.extend({
                             userTasks.push(it);
                         }
                     }
-                    if (userTasks.length === 0) return;
+                    if (userTasks.length === 0) return callback(null);
 
                     userTasks.sort(function(a, b) {
                         var movA = parseInt(a.movementSequence, 10) || 0;
@@ -226,27 +228,32 @@ var Central_de_tarefas = SuperWidget.extend({
                         return dateB - dateA;
                     });
 
-                    context = {
+                    callback({
                         movementSequence: userTasks[0].movementSequence,
                         assigneeCode: userTasks[0].assignee && userTasks[0].assignee.code
-                    };
+                    });
                 },
                 error: function(xhr, st, err) {
+                    if (instance.debugPerf) {
+                        console.log('[CentralTarefas][perf] ajax.requests-tasks (error): ' + Math.round(instance._perfNow() - _t0) + 'ms');
+                    }
                     console.error("Erro ao buscar tarefas da solicitação:", st, err);
+                    callback(null);
                 }
             });
         } catch (e) {
             console.error("Falha na consulta REST de tarefas:", e);
+            callback(null);
         }
-        if (_debugPerf) {
-            console.log('[CentralTarefas][perf] ajax.requests-tasks (sync): ' + Math.round(_perfNow.call(null) - _ajaxT0) + 'ms');
-        }
-        return context;
     },
 
     // Abre a solicitação no Fluig em nova aba (híbrido):
     //  - se houver tarefa ativa do usuário logado → abre o formulário da tarefa
     //  - senão → abre a tela de detalhes/consulta
+    //
+    // window.open precisa rodar no mesmo tick do clique (handler do gesto) para
+    // não ser bloqueado pelo popup blocker. Por isso a janela é aberta JÁ aqui
+    // com about:blank + loader, e só depois recebe a URL final via async.
     openRequest: function(task) {
         var instance = this;
         if (!task || !task.processInstanceId) return;
@@ -267,22 +274,47 @@ var Central_de_tarefas = SuperWidget.extend({
         }
 
         var base = serverURL + '/portal/p/' + tenant + '/pageworkflowview?';
-        var url;
+        var fallbackUrl = base + 'app_ecm_workflowview_detailsProcessInstanceID=' + encodeURIComponent(task.processInstanceId);
 
-        // Tenta a rota de tarefa (formulário editável) só se for tarefa do usuário logado
-        var ctx = instance.fetchUserTaskContext(task.processId, task.processInstanceId);
-        if (ctx && ctx.movementSequence && ctx.assigneeCode) {
-            url = base
-                + 'app_ecm_workflowview_processInstanceId=' + encodeURIComponent(task.processInstanceId)
-                + '&app_ecm_workflowview_currentMovto=' + encodeURIComponent(ctx.movementSequence)
-                + '&app_ecm_workflowview_taskUserId=' + encodeURIComponent(ctx.assigneeCode)
-                + '&app_ecm_workflowview_managerMode=false';
-        } else {
-            // Fallback: tela de detalhes/consulta da solicitação
-            url = base + 'app_ecm_workflowview_detailsProcessInstanceID=' + encodeURIComponent(task.processInstanceId);
+        // Abre a janela AGORA, no tick do clique. Sem isso o popup blocker bloqueia.
+        var win = window.open('about:blank', '_blank');
+        if (!win) {
+            console.warn("Abertura da solicitação bloqueada pelo navegador. Habilite popups para este site.");
+            return;
         }
 
-        window.open(url, '_blank');
+        // Loader simples enquanto a chamada async resolve a tarefa
+        try {
+            win.document.open();
+            win.document.write(
+                '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">' +
+                '<title>Abrindo solicitação…</title>' +
+                '<style>body{font-family:Lato,Arial,sans-serif;color:#5a5a5a;padding:40px;text-align:center}</style>' +
+                '</head><body>Abrindo solicitação…</body></html>'
+            );
+            win.document.close();
+        } catch (eDoc) {
+            // alguns navegadores podem bloquear escrita no about:blank — segue sem loader
+        }
+
+        // Resolve contexto da tarefa e atualiza a janela com a URL final
+        instance.fetchUserTaskContextAsync(task.processId, task.processInstanceId, function(ctx) {
+            var finalUrl;
+            if (ctx && ctx.movementSequence && ctx.assigneeCode) {
+                finalUrl = base
+                    + 'app_ecm_workflowview_processInstanceId=' + encodeURIComponent(task.processInstanceId)
+                    + '&app_ecm_workflowview_currentMovto=' + encodeURIComponent(ctx.movementSequence)
+                    + '&app_ecm_workflowview_taskUserId=' + encodeURIComponent(ctx.assigneeCode)
+                    + '&app_ecm_workflowview_managerMode=false';
+            } else {
+                finalUrl = fallbackUrl;
+            }
+            try {
+                win.location.href = finalUrl;
+            } catch (eNav) {
+                console.error("Não foi possível navegar a janela para a solicitação:", eNav);
+            }
+        });
     },
 
     // Hybrid data loader: Fluig dataset -> fallback to rich mock data
