@@ -477,7 +477,8 @@ var Central_de_tarefas = SuperWidget.extend({
     },
 
     // Carrega mapa colleagueId → nome amigável a partir do dataset nativo "colleague".
-    // Resolve tanto responsáveis (assigneeIds) quanto solicitantes (requesterId).
+    // Resolve apenas responsáveis (assigneeIds). Para solicitantes usa-se requesterName
+    // que já vem no workflowProcess — evita N+1 inteiro de requesters.
     // Query por ID com constraint (evita carregar todo o dataset de colaboradores).
     // Falha silenciosa: nome ausente cai para o id como fallback.
     loadColleagueNames: function() {
@@ -486,13 +487,15 @@ var Central_de_tarefas = SuperWidget.extend({
 
         if (typeof DatasetFactory === 'undefined') return;
 
-        // Coleta IDs únicos a resolver: responsáveis + solicitantes
+        // Coleta apenas IDs de responsáveis. Para solicitantes, getUserDisplayName()
+        // já faz fallback para requesterName quando o ID não está no map.
+        // Combinado com o escopo pessoal (MATRICULA), o conjunto de assignees colapsa
+        // na prática para ~1 entrada (o próprio usuário logado).
         var idsNeeded = {};
         instance.requests.forEach(function(req) {
             (req.assigneeIds || []).forEach(function(id) {
                 if (id) idsNeeded[id] = true;
             });
-            if (req.requesterId) idsNeeded[req.requesterId] = true;
         });
 
         var ids = Object.keys(idsNeeded);
