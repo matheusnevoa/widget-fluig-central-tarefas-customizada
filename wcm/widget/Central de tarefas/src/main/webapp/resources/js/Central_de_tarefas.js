@@ -21,6 +21,11 @@ var Central_de_tarefas = SuperWidget.extend({
     // Vive durante a sessão da instância — atividades de processo não mudam em runtime.
     _processStateCache: null,
 
+    // Status do carregamento inicial — diferencia vazio legítimo de erro real.
+    // Valores: 'ok' | 'error' | 'no-env'
+    _loadStatus: 'ok',
+    _loadError: null,
+
     _perfNow: function() {
         return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
     },
@@ -85,6 +90,9 @@ var Central_de_tarefas = SuperWidget.extend({
 
         // Bind dynamic event listeners
         instance.setupEvents();
+
+        // Decide se mostra estado vazio inicial (vazio legítimo, erro de load ou sem ambiente)
+        instance.renderEmptyState();
 
         if (instance.debugPerf) {
             console.log('[CentralTarefas][perf] init: ' + Math.round(instance._perfNow() - _initT0) + 'ms');
@@ -354,6 +362,8 @@ var Central_de_tarefas = SuperWidget.extend({
         // Check if we are running in the Fluig WCM environment
         if (typeof DatasetFactory !== 'undefined' && typeof WCMAPI !== 'undefined') {
             data = instance.getFluigData();
+        } else {
+            instance._loadStatus = 'no-env';
         }
         return data;
     },
@@ -533,6 +543,8 @@ var Central_de_tarefas = SuperWidget.extend({
             }
         } catch (e) {
             console.error("Erro ao consultar datasets do Fluig:", e);
+            this._loadStatus = 'error';
+            this._loadError = e;
         }
         return data;
     },
@@ -742,6 +754,44 @@ var Central_de_tarefas = SuperWidget.extend({
         instance.updateFiltersBarUI();
     },
 
+    // Renderiza estado vazio inicial (após loadData). Mostra mensagem amigável
+    // distinguindo 3 cenários: erro de carregamento, ambiente Fluig ausente, vazio legítimo.
+    // O caso de "vazio por filtro" (filtro aplicado zera resultado) é tratado em selectStatus.
+    renderEmptyState: function() {
+        var instance = this;
+        var $box = $('#empty-state-' + instance.instanceId);
+        if ($box.length === 0) return;
+
+        // Há solicitações → esconder qualquer estado vazio ativo
+        if (instance.requests.length > 0 && instance._loadStatus === 'ok') {
+            $box.addClass('d-none').removeClass('is-error');
+            return;
+        }
+
+        var title, subtitle, isError = false;
+
+        if (instance._loadStatus === 'error') {
+            isError = true;
+            title = 'Não foi possível carregar as solicitações no momento.';
+            subtitle = 'Tente recarregar a página. Se o problema persistir, acione o suporte técnico.';
+        } else if (instance._loadStatus === 'no-env') {
+            title = 'Ambiente Fluig não detectado.';
+            subtitle = 'Esta widget precisa rodar dentro do Fluig para carregar solicitações.';
+        } else {
+            title = 'Nenhuma solicitação encontrada para o seu usuário.';
+            subtitle = 'Quando houver solicitações atribuídas a você ou abertas por você, elas aparecerão aqui.';
+        }
+
+        $box.toggleClass('is-error', isError);
+        $box.find('.empty-state-title').text(title);
+        $box.find('.empty-state-subtitle').text(subtitle);
+        $box.removeClass('d-none');
+
+        // Garante que carrossel e Kanban fiquem ocultos no estado vazio inicial
+        $('#carousel-section-' + instance.instanceId).addClass('d-none');
+        $('#kanban-section-' + instance.instanceId).addClass('d-none');
+    },
+
     // Escapa HTML para uso seguro em option values e labels
     escapeHtml: function(text) {
         if (text === null || text === undefined) return '';
@@ -885,6 +935,7 @@ var Central_de_tarefas = SuperWidget.extend({
             $('#kanban-section-' + instance.instanceId).addClass('d-none');
             instance.renderKPIs();
             instance.updateFiltersBarUI();
+            instance.renderEmptyState();
         } else if (instance.filters.hasOwnProperty(key)) {
             instance.filters[key] = 'all';
             root.find('#filter-' + key + '-' + instance.instanceId).val('all');
@@ -911,6 +962,7 @@ var Central_de_tarefas = SuperWidget.extend({
 
         instance.renderKPIs();
         instance.updateFiltersBarUI();
+        instance.renderEmptyState();
     },
 
     // Renders totals into the status KPI cards
@@ -946,6 +998,10 @@ var Central_de_tarefas = SuperWidget.extend({
         var resetSearch = !options || options.resetSearch !== false;
         instance.currentStatus = status;
         instance.carouselIndex = 0;
+
+        // Ao entrar em drill-down via KPI, esconde o estado vazio inicial.
+        // (O caso "vazio por filtro" é mostrado dentro do carrossel logo abaixo.)
+        $('#empty-state-' + instance.instanceId).addClass('d-none');
 
         // Toggle active visual class on KPI cards
         var root = $('#Central_de_tarefas_' + instance.instanceId);
@@ -1004,7 +1060,17 @@ var Central_de_tarefas = SuperWidget.extend({
         track.css('transform', 'translateX(0px)');
 
         if (processes.length === 0) {
-            track.append('<div style="padding: 20px; color: var(--text-muted); width: 100%; text-align: center; font-weight: 500;">Nenhum processo encontrado com solicitações nessa situação.</div>');
+            // Distingue "filtros base zeraram a lista inteira" vs "este status específico não tem processo".
+            // baseRequests = pós-filtros base; se vazio mesmo com requests originais cheias = filtro zerou tudo.
+            var hasAnyData = instance.requests.length > 0;
+            var hasAnyAfterBaseFilters = baseRequests.length > 0;
+            var emptyMsg;
+            if (hasAnyData && !hasAnyAfterBaseFilters) {
+                emptyMsg = 'Nenhuma solicitação encontrada com os filtros atuais.';
+            } else {
+                emptyMsg = 'Nenhum processo encontrado com solicitações nessa situação.';
+            }
+            track.append('<div style="padding: 20px; color: var(--text-muted); width: 100%; text-align: center; font-weight: 500;">' + instance.escapeHtml(emptyMsg) + '</div>');
             $('#carousel-section-' + instance.instanceId).removeClass('d-none');
             $('#kanban-section-' + instance.instanceId).addClass('d-none');
 
