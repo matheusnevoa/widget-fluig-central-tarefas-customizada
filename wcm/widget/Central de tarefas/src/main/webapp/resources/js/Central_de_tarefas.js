@@ -572,7 +572,9 @@ var Central_de_tarefas = SuperWidget.extend({
         });
 
         var ids = Object.keys(idsNeeded);
-        if (ids.length === 0) return;
+        // Sem early return: a residual de SOLICITANTES (logo abaixo) precisa rodar
+        // mesmo quando não há assignees a resolver — caso típico de usuário Identity
+        // que aparece só como requester, nunca como assignee.
 
         ids.forEach(function(id) {
             try {
