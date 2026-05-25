@@ -106,9 +106,14 @@ var Central_de_tarefas = SuperWidget.extend({
             instance.slideCarousel('next');
         });
 
-        // Kanban search input
+        // Kanban search input — debounce 250ms para evitar re-render por tecla
+        var _searchTimer = null;
         $(rootSelector).on('input', '#kanban-search-' + instance.instanceId, function() {
-            instance.renderKanban();
+            if (_searchTimer) clearTimeout(_searchTimer);
+            _searchTimer = setTimeout(function() {
+                _searchTimer = null;
+                instance.renderKanban();
+            }, 250);
         });
 
         // Filtros base (solicitante, responsavel, categoria)
