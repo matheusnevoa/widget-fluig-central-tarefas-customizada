@@ -8,9 +8,39 @@ var Central_de_tarefas = SuperWidget.extend({
     currentProcess: null,
     carouselIndex: 0,
 
+    // === Fase 0: instrumentação opt-in de performance ===
+    // Ativar manualmente no console: Central_de_tarefas.instance().debugPerf = true; (e recarregar widget)
+    // Quando OFF (default), helpers viram no-op — zero overhead em produção.
+    debugPerf: false,
+    _perfCounters: null,
+
+    _perfNow: function() {
+        return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    },
+    _perfCount: function(label) {
+        if (!this.debugPerf) return;
+        if (!this._perfCounters) this._perfCounters = {};
+        this._perfCounters[label] = (this._perfCounters[label] || 0) + 1;
+    },
+    _perfTime: function(label, fn) {
+        if (!this.debugPerf) return fn.call(this);
+        var t0 = this._perfNow();
+        try {
+            return fn.call(this);
+        } finally {
+            console.log('[CentralTarefas][perf] ' + label + ': ' + Math.round(this._perfNow() - t0) + 'ms');
+        }
+    },
+    _perfReport: function(label) {
+        if (!this.debugPerf) return;
+        console.log('[CentralTarefas][perf] ' + label + ' counters:', JSON.stringify(this._perfCounters || {}));
+    },
+
     // Widget initialization
     init: function() {
         var instance = this;
+        instance._perfCounters = {};
+        var _initT0 = instance._perfNow();
 
         // Estado por instância (objetos não podem ficar no protótipo)
         instance.filters = { solicitante: 'all', responsavel: 'all', categoria: 'all' };
@@ -37,6 +67,11 @@ var Central_de_tarefas = SuperWidget.extend({
 
         // Bind dynamic event listeners
         instance.setupEvents();
+
+        if (instance.debugPerf) {
+            console.log('[CentralTarefas][perf] init: ' + Math.round(instance._perfNow() - _initT0) + 'ms');
+            instance._perfReport('init');
+        }
     },
 
     // BIND de eventos do Fluig (we use delegated jQuery events for reliability with dynamic elements)
@@ -145,6 +180,11 @@ var Central_de_tarefas = SuperWidget.extend({
             : (typeof $ !== 'undefined' && $.ajax ? $.ajax : null);
         if (!requestFn) return null;
 
+        this._perfCount('ajax.requests-tasks');
+        var _ajaxT0 = this._perfNow();
+        var _debugPerf = this.debugPerf;
+        var _perfNow = this._perfNow;
+
         var context = null;
         try {
             requestFn({
@@ -187,6 +227,9 @@ var Central_de_tarefas = SuperWidget.extend({
             });
         } catch (e) {
             console.error("Falha na consulta REST de tarefas:", e);
+        }
+        if (_debugPerf) {
+            console.log('[CentralTarefas][perf] ajax.requests-tasks (sync): ' + Math.round(_perfNow.call(null) - _ajaxT0) + 'ms');
         }
         return context;
     },
@@ -251,10 +294,12 @@ var Central_de_tarefas = SuperWidget.extend({
             // Get all workflow instances
             var constraintsWorkflow = [];
             constraintsWorkflow.push(DatasetFactory.createConstraint("active", "true", "true", ConstraintType.MUST));
+            this._perfCount('dataset.workflowProcess');
             var dsWorkflow = DatasetFactory.getDataset("workflowProcess", null, constraintsWorkflow, null);
             if (dsWorkflow && dsWorkflow.values && dsWorkflow.values.length > 0) {
 
                 // Get active tasks to find current activity name, deadlines and assignees
+                this._perfCount('dataset.ds_process_task');
                 var dsTasks = DatasetFactory.getDataset("ds_process_task", null, null, null);
                 var activeTaskMap = {};
 
@@ -280,6 +325,7 @@ var Central_de_tarefas = SuperWidget.extend({
                 }
 
                 // Process definition dataset to get cleaner process names
+                this._perfCount('dataset.processDefinition');
                 var dsDef = DatasetFactory.getDataset("processDefinition", null, null, null);
                 var processNames = {};
                 var categoryNames = {};
@@ -290,6 +336,11 @@ var Central_de_tarefas = SuperWidget.extend({
                         categoryNames[def["processDefinitionPK.processId"]] = def.categoryId;
                     }
                 }
+
+                // Mapa cardDocumentId → descriptor textual do registro de formulário.
+                // Prioridade do texto: documentDescription → cardDescription.
+                // Seleção de versão: activeVersion === true; fallback = maior documentPK.version.
+                var descriptorMap = this.buildDescriptorMap(dsWorkflow.values);
 
                 for (var i = 0; i < dsWorkflow.values.length; i++) {
                     var w = dsWorkflow.values[i];
@@ -360,6 +411,13 @@ var Central_de_tarefas = SuperWidget.extend({
                         }
                     }
 
+                    // cardDocumentId pode vir como "null" (string), 0 ou ausente
+                    var cardDocumentId = w.cardDocumentId;
+                    if (cardDocumentId === 'null' || cardDocumentId === '0' || cardDocumentId === 0 || cardDocumentId === undefined) {
+                        cardDocumentId = null;
+                    }
+                    var descriptorText = (cardDocumentId && descriptorMap[cardDocumentId]) ? descriptorMap[cardDocumentId] : null;
+
                     data.push({
                         id: "FLUIG-" + instanceId,
                         processInstanceId: instanceId,
@@ -373,6 +431,8 @@ var Central_de_tarefas = SuperWidget.extend({
                         currentActivity: currentActivity,
                         categoryId: categoryId,
                         assigneeIds: assigneeIds,
+                        cardDocumentId: cardDocumentId,
+                        descriptor: descriptorText,
                         description: "Solicitação gerada para o processo " + procName,
                         priority: instanceId % 3 === 0 ? "Alta" : (instanceId % 3 === 1 ? "Média" : "Baixa")
                     });
@@ -409,6 +469,7 @@ var Central_de_tarefas = SuperWidget.extend({
         ids.forEach(function(id) {
             try {
                 var c1 = DatasetFactory.createConstraint("colleaguePK.colleagueId", id, id, ConstraintType.MUST);
+                instance._perfCount('dataset.colleague');
                 var ds = DatasetFactory.getDataset("colleague", null, [c1], null);
                 if (ds && ds.values && ds.values.length > 0) {
                     var c = ds.values[0];
@@ -418,6 +479,75 @@ var Central_de_tarefas = SuperWidget.extend({
                 // Silencioso — falha em uma resolução não deve travar o widget
             }
         });
+    },
+
+    // Resolve o descriptor (texto descritivo da solicitação) a partir do dataset 'document'.
+    // Recebe a lista bruta de workflowProcess.values e retorna mapa cardDocumentId → texto.
+    //
+    // Estratégia:
+    //  1. Deduplica cardDocumentIds válidos do workflowProcess.
+    //  2. Consulta dataset 'document' por documentPK.documentId (1 chamada por documento único).
+    //  3. Seleciona a linha com activeVersion === true; fallback: maior documentPK.version.
+    //  4. Prioriza documentDescription → cardDescription; ignora valores vazios/"null".
+    //
+    // Falha silenciosa por item — uma resolução com erro não trava o widget.
+    buildDescriptorMap: function(workflowValues) {
+        var map = {};
+        if (typeof DatasetFactory === 'undefined' || !workflowValues) return map;
+
+        // Deduplica cardDocumentIds válidos
+        var idsNeeded = {};
+        for (var i = 0; i < workflowValues.length; i++) {
+            var cdId = workflowValues[i].cardDocumentId;
+            if (cdId && cdId !== 'null' && cdId !== '0' && cdId !== 0) {
+                idsNeeded[cdId] = true;
+            }
+        }
+        var ids = Object.keys(idsNeeded);
+        if (ids.length === 0) return map;
+
+        var self = this;
+        ids.forEach(function(docId) {
+            try {
+                var c1 = DatasetFactory.createConstraint("documentPK.documentId", docId, docId, ConstraintType.MUST);
+                self._perfCount('dataset.document');
+                var dsDoc = DatasetFactory.getDataset("document", null, [c1], null);
+                if (!dsDoc || !dsDoc.values || dsDoc.values.length === 0) return;
+
+                // 1ª escolha: activeVersion === true
+                var chosen = null;
+                for (var dv = 0; dv < dsDoc.values.length; dv++) {
+                    var row = dsDoc.values[dv];
+                    if (row.activeVersion === true || row.activeVersion === "true") {
+                        chosen = row;
+                        break;
+                    }
+                }
+                // Fallback: maior documentPK.version
+                if (!chosen) {
+                    var sorted = dsDoc.values.slice().sort(function(a, b) {
+                        var va = parseInt(a["documentPK.version"] || a.version || 0, 10) || 0;
+                        var vb = parseInt(b["documentPK.version"] || b.version || 0, 10) || 0;
+                        return vb - va;
+                    });
+                    chosen = sorted[0];
+                }
+                if (!chosen) return;
+
+                // Prioridade do texto: documentDescription → cardDescription
+                var text = chosen.documentDescription;
+                if (!text || text === 'null' || String(text).trim() === '') {
+                    text = chosen.cardDescription;
+                }
+                if (text && text !== 'null' && String(text).trim() !== '') {
+                    map[docId] = String(text).trim();
+                }
+            } catch (e) {
+                // Silencioso — falha em uma resolução não deve travar o widget
+            }
+        });
+
+        return map;
     },
 
     // Retorna o nome amigável de um usuário.
@@ -857,6 +987,7 @@ var Central_de_tarefas = SuperWidget.extend({
                 constraints.push(DatasetFactory.createConstraint("processStatePK.companyId", companyId, companyId, ConstraintType.MUST));
                 constraints.push(DatasetFactory.createConstraint("automatic", false, false, ConstraintType.MUST));
 
+                instance._perfCount('dataset.processState');
                 var dsProcessState = DatasetFactory.getDataset("processState", null, constraints, null);
 
                 if (dsProcessState && dsProcessState.values && dsProcessState.values.length > 0) {
@@ -920,11 +1051,17 @@ var Central_de_tarefas = SuperWidget.extend({
         var instance = this;
         var processId = instance.currentProcess;
         var status = instance.currentStatus;
+        var _renderT0 = instance._perfNow();
 
         var board = $('#kanban-board-' + instance.instanceId);
         board.empty();
 
-        if (!processId) return;
+        if (!processId) {
+            if (instance.debugPerf) {
+                console.log('[CentralTarefas][perf] renderKanban (skip): ' + Math.round(instance._perfNow() - _renderT0) + 'ms');
+            }
+            return;
+        }
 
         // Fonte: requests JÁ filtrados por filtros base
         var baseRequests = instance.getFilteredRequests();
@@ -947,6 +1084,7 @@ var Central_de_tarefas = SuperWidget.extend({
             finalRequests = statusRequests.filter(function(r) {
                 return r.id.toLowerCase().indexOf(q) !== -1 ||
                        (r.requester || '').toLowerCase().indexOf(q) !== -1 ||
+                       (r.descriptor || '').toLowerCase().indexOf(q) !== -1 ||
                        (r.description || '').toLowerCase().indexOf(q) !== -1;
             });
         }
@@ -1027,7 +1165,7 @@ var Central_de_tarefas = SuperWidget.extend({
                                           '<line x1="12" y1="17" x2="12.01" y2="17"></line>' +
                                       '</svg>ATRASADO</span>'
                                 : '') +
-                            '<p class="card-description">' + instance.escapeHtml(req.description) + '</p>' +
+                            '<p class="card-description">' + instance.escapeHtml(req.descriptor || req.description) + '</p>' +
                             '<div class="card-assignee" title="Respons\u00e1vel: ' + instance.escapeHtml(respName) + respExtra + '">' +
                                 '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="card-assignee-icon">' +
                                     '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>' +
@@ -1046,6 +1184,10 @@ var Central_de_tarefas = SuperWidget.extend({
             colHtml += '</div></div>';
             board.append(colHtml);
         });
+
+        if (instance.debugPerf) {
+            console.log('[CentralTarefas][perf] renderKanban (' + activities.length + ' cols, ' + finalRequests.length + ' reqs): ' + Math.round(instance._perfNow() - _renderT0) + 'ms');
+        }
     },
 
     // Slides the carousel track horizontally
