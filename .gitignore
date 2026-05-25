@@ -1,0 +1,6 @@
+# Local IDE/server configuration
+.vscode/
+
+# Build artifacts
+target/
+*.war

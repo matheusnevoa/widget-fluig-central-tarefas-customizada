@@ -1,0 +1,1097 @@
+var Central_de_tarefas = SuperWidget.extend({
+
+    // Local state variables
+    requests: [],
+    filters: null,            // Inicializado em init() para evitar compartilhamento entre instâncias
+    colleagueMap: null,       // Idem
+    currentStatus: null,
+    currentProcess: null,
+    carouselIndex: 0,
+
+    // Widget initialization
+    init: function() {
+        var instance = this;
+
+        // Estado por instância (objetos não podem ficar no protótipo)
+        instance.filters = { solicitante: 'all', responsavel: 'all', categoria: 'all' };
+        instance.colleagueMap = {};
+
+        // Hide containers initially
+        $('#carousel-section-' + instance.instanceId).addClass('d-none');
+        $('#kanban-section-' + instance.instanceId).addClass('d-none');
+
+        // Load dataset or mock data
+        instance.requests = instance.loadData();
+
+        // Resolve nomes amigáveis de responsáveis e solicitantes (id → nome)
+        instance.loadColleagueNames();
+
+        // Aplica nome amigável do solicitante nos requests
+        instance.resolveRequesterNames();
+
+        // Popula os selects de filtro a partir dos dados carregados
+        instance.populateFilters();
+
+        // Compute and show status card numbers
+        instance.renderKPIs();
+
+        // Bind dynamic event listeners
+        instance.setupEvents();
+    },
+
+    // BIND de eventos do Fluig (we use delegated jQuery events for reliability with dynamic elements)
+    bindings: {
+        local: {},
+        global: {}
+    },
+
+    // Setup event handlers using jQuery delegation
+    setupEvents: function() {
+        var instance = this;
+        var rootSelector = '#Central_de_tarefas_' + instance.instanceId;
+
+        // KPI Status card selection
+        $(rootSelector).on('click', '[data-status-card]', function() {
+            var status = $(this).attr('data-status-card');
+            instance.selectStatus(status);
+        });
+
+        // Process selection inside the carousel
+        $(rootSelector).on('click', '[data-process-id]', function() {
+            var processId = $(this).attr('data-process-id');
+            instance.selectProcess(processId);
+        });
+
+        // Carousel buttons
+        $(rootSelector).on('click', '#carousel-prev-' + instance.instanceId, function() {
+            instance.slideCarousel('prev');
+        });
+
+        $(rootSelector).on('click', '#carousel-next-' + instance.instanceId, function() {
+            instance.slideCarousel('next');
+        });
+
+        // Kanban search input
+        $(rootSelector).on('input', '#kanban-search-' + instance.instanceId, function() {
+            instance.renderKanban();
+        });
+
+        // Filtros base (solicitante, responsavel, categoria)
+        $(rootSelector).on('change', '.filter-select', function() {
+            var key = $(this).attr('data-filter-key');
+            var val = $(this).val();
+            if (key && instance.filters.hasOwnProperty(key)) {
+                instance.filters[key] = val;
+                instance.applyFiltersAndRefresh();
+            }
+        });
+
+        // Botão Limpar Filtros
+        $(rootSelector).on('click', '#clear-filters-' + instance.instanceId, function() {
+            instance.clearAllFilters();
+        });
+
+        // Botão × de cada chip (remove filtro individual)
+        $(rootSelector).on('click', '.filter-chip-remove', function() {
+            var $chip = $(this).closest('.filter-chip');
+            var key = $chip.attr('data-chip-key');
+            if (key) instance.removeFilter(key);
+        });
+
+        // Abrir solicitação ao clicar em qualquer área do card
+        $(rootSelector).on('click', '.kanban-card[data-process-instance]', function() {
+            instance.openRequest({
+                processInstanceId: $(this).attr('data-process-instance'),
+                processId: $(this).attr('data-process-id')
+            });
+        });
+
+        // Acessibilidade — abrir com Enter/Espaço quando o card tem foco
+        $(rootSelector).on('keydown', '.kanban-card[data-process-instance]', function(ev) {
+            if (ev.key === 'Enter' || ev.key === ' ' || ev.keyCode === 13 || ev.keyCode === 32) {
+                ev.preventDefault();
+                instance.openRequest({
+                    processInstanceId: $(this).attr('data-process-instance'),
+                    processId: $(this).attr('data-process-id')
+                });
+            }
+        });
+    },
+
+    // Resolve o login do usuário logado, com fallbacks seguros
+    getLoggedUser: function() {
+        if (typeof WCMAPI === 'undefined') return null;
+        if (WCMAPI.userCode) return WCMAPI.userCode;
+        if (WCMAPI.getUserCode) return WCMAPI.getUserCode();
+        if (WCMAPI.user) return WCMAPI.user;
+        return null;
+    },
+
+    // Busca as tarefas ativas de uma solicitação via REST.
+    // Retorna { movementSequence, assigneeCode } da tarefa do usuário logado, ou null.
+    fetchUserTaskContext: function(processId, processInstanceId) {
+        if (!processId || !processInstanceId) return null;
+
+        var loggedUser = this.getLoggedUser();
+        if (!loggedUser) return null;
+
+        var serverURL = WCMAPI.serverURL || (WCMAPI.getServerURL && WCMAPI.getServerURL()) || '';
+        var url = serverURL
+                + '/process-management/api/v2/processes/' + encodeURIComponent(processId)
+                + '/requests/tasks?processInstanceId=' + encodeURIComponent(processInstanceId);
+
+        var requestFn = (typeof FLUIGC !== 'undefined' && FLUIGC.ajax)
+            ? FLUIGC.ajax
+            : (typeof $ !== 'undefined' && $.ajax ? $.ajax : null);
+        if (!requestFn) return null;
+
+        var context = null;
+        try {
+            requestFn({
+                dataType: 'json',
+                url: url,
+                type: 'GET',
+                contentType: 'application/json',
+                async: false,
+                loading: false,
+                success: function(result) {
+                    var items = (result && result.items) ? result.items : [];
+                    var userTasks = [];
+                    for (var i = 0; i < items.length; i++) {
+                        var it = items[i];
+                        var code = it.assignee && it.assignee.code;
+                        if (code === loggedUser && it.movementSequence) {
+                            userTasks.push(it);
+                        }
+                    }
+                    if (userTasks.length === 0) return;
+
+                    userTasks.sort(function(a, b) {
+                        var movA = parseInt(a.movementSequence, 10) || 0;
+                        var movB = parseInt(b.movementSequence, 10) || 0;
+                        if (movA !== movB) return movB - movA;
+
+                        var dateA = new Date(a.assignStartDate || a.startDate || 0).getTime() || 0;
+                        var dateB = new Date(b.assignStartDate || b.startDate || 0).getTime() || 0;
+                        return dateB - dateA;
+                    });
+
+                    context = {
+                        movementSequence: userTasks[0].movementSequence,
+                        assigneeCode: userTasks[0].assignee && userTasks[0].assignee.code
+                    };
+                },
+                error: function(xhr, st, err) {
+                    console.error("Erro ao buscar tarefas da solicitação:", st, err);
+                }
+            });
+        } catch (e) {
+            console.error("Falha na consulta REST de tarefas:", e);
+        }
+        return context;
+    },
+
+    // Abre a solicitação no Fluig em nova aba (híbrido):
+    //  - se houver tarefa ativa do usuário logado → abre o formulário da tarefa
+    //  - senão → abre a tela de detalhes/consulta
+    openRequest: function(task) {
+        var instance = this;
+        if (!task || !task.processInstanceId) return;
+
+        if (typeof WCMAPI === 'undefined') {
+            console.error("WCMAPI indisponível — não é possível abrir a solicitação.");
+            return;
+        }
+
+        var serverURL = WCMAPI.serverURL || (WCMAPI.getServerURL && WCMAPI.getServerURL()) || '';
+        var tenant = WCMAPI.organizationId
+                  || (WCMAPI.getTenantCode && WCMAPI.getTenantCode())
+                  || (WCMAPI.getOrganizationId && WCMAPI.getOrganizationId());
+
+        if (!tenant) {
+            console.error("Tenant indisponível — não é possível montar a URL da solicitação.");
+            return;
+        }
+
+        var base = serverURL + '/portal/p/' + tenant + '/pageworkflowview?';
+        var url;
+
+        // Tenta a rota de tarefa (formulário editável) só se for tarefa do usuário logado
+        var ctx = instance.fetchUserTaskContext(task.processId, task.processInstanceId);
+        if (ctx && ctx.movementSequence && ctx.assigneeCode) {
+            url = base
+                + 'app_ecm_workflowview_processInstanceId=' + encodeURIComponent(task.processInstanceId)
+                + '&app_ecm_workflowview_currentMovto=' + encodeURIComponent(ctx.movementSequence)
+                + '&app_ecm_workflowview_taskUserId=' + encodeURIComponent(ctx.assigneeCode)
+                + '&app_ecm_workflowview_managerMode=false';
+        } else {
+            // Fallback: tela de detalhes/consulta da solicitação
+            url = base + 'app_ecm_workflowview_detailsProcessInstanceID=' + encodeURIComponent(task.processInstanceId);
+        }
+
+        window.open(url, '_blank');
+    },
+
+    // Hybrid data loader: Fluig dataset -> fallback to rich mock data
+    loadData: function() {
+        var instance = this;
+        var data = [];
+
+        // Check if we are running in the Fluig WCM environment
+        if (typeof DatasetFactory !== 'undefined' && typeof WCMAPI !== 'undefined') {
+            data = instance.getFluigData();
+        }
+        return data;
+    },
+
+    // Retrieve and join Fluig Datasets
+    getFluigData: function() {
+        var data = [];
+        try {
+            // Get all workflow instances
+            var constraintsWorkflow = [];
+            constraintsWorkflow.push(DatasetFactory.createConstraint("active", "true", "true", ConstraintType.MUST));
+            var dsWorkflow = DatasetFactory.getDataset("workflowProcess", null, constraintsWorkflow, null);
+            if (dsWorkflow && dsWorkflow.values && dsWorkflow.values.length > 0) {
+
+                // Get active tasks to find current activity name, deadlines and assignees
+                var dsTasks = DatasetFactory.getDataset("ds_process_task", null, null, null);
+                var activeTaskMap = {};
+
+                if (dsTasks && dsTasks.values) {
+                    for (var j = 0; j < dsTasks.values.length; j++) {
+                        var task = dsTasks.values[j];
+                        // check if task is active
+                        if (task.LOG_ATIV === "true" || task.LOG_ATIV === true) {
+                            // Array para suportar processos com múltiplas tarefas ativas (paralelismo/pool)
+                            if (!activeTaskMap[task.NUM_PROCES]) {
+                                activeTaskMap[task.NUM_PROCES] = [];
+                            }
+                            var aid = task.CD_MATRICULA;
+                            // Dataset retorna "null" como string para valores nulos do SQL
+                            if (aid === 'null' || aid === undefined) aid = null;
+                            activeTaskMap[task.NUM_PROCES].push({
+                                activityDescription: task.DES_ESTADO || ("Atividade " + task.NUM_SEQ_ESTADO),
+                                deadline: task.DEADLINE,
+                                assigneeId: aid
+                            });
+                        }
+                    }
+                }
+
+                // Process definition dataset to get cleaner process names
+                var dsDef = DatasetFactory.getDataset("processDefinition", null, null, null);
+                var processNames = {};
+                var categoryNames = {};
+                if (dsDef && dsDef.values) {
+                    for (var k = 0; k < dsDef.values.length; k++) {
+                        var def = dsDef.values[k];
+                        processNames[def["processDefinitionPK.processId"]] = def.processDescription;
+                        categoryNames[def["processDefinitionPK.processId"]] = def.categoryId;
+                    }
+                }
+
+                for (var i = 0; i < dsWorkflow.values.length; i++) {
+                    var w = dsWorkflow.values[i];
+                    var instanceId = w.processInstanceId || w["workflowProcessPK.processInstanceId"];
+                    var procId = w.processId;
+
+                    // Format process name nicely
+                    var procName = processNames[procId] || w.processDescription || procId;
+                    procName = procName.replace(/_/g, " ");
+                    var categoryId = categoryNames[procId];
+                    if (categoryId === 'null' || categoryId === undefined) categoryId = null;
+
+                    // Solicitante: guarda id e name separados (login técnico pode vir em qualquer um)
+                    var requesterId = w.requesterId || null;
+                    var requesterName = w.requesterName || null;
+                    var requester = requesterName || requesterId || "Solicitante";
+                    var start = w.startDate || w.startPeriod;
+
+                    // Determine request state (active/inactive)
+                    var active = w.active === "true" || w.active === true || w.state === 0 || w.state === "0";
+
+                    var dateStr = "";
+                    if (start) {
+                        var d = new Date(start);
+                        dateStr = isNaN(d.getTime()) ? start : d.toLocaleDateString('pt-BR');
+                    } else {
+                        dateStr = new Date().toLocaleDateString('pt-BR');
+                    }
+
+                    // Tarefas ativas desse processo (pode haver múltiplas em paralelismo/pool)
+                    var currentTasks = activeTaskMap[instanceId] || [];
+                    var currentTask = currentTasks[0]; // Tarefa principal para exibição
+                    var currentActivity = "Finalizado";
+                    var status = "concluidas";
+                    if (active) {
+                        currentActivity = currentTask ? currentTask.activityDescription : "Início";
+                        // Processo está atrasado se QUALQUER tarefa ativa estiver vencida
+                        var isDelayed = false;
+                        var hasMoment = typeof moment !== 'undefined';
+                        var nowMs = Date.now();
+                        for (var t = 0; t < currentTasks.length; t++) {
+                            var activeTask = currentTasks[t];
+                            if (!activeTask || !activeTask.deadline) continue;
+                            if (hasMoment) {
+                                var deadLine = moment(activeTask.deadline, 'YYYY-MM-DD HH:mm:ss');
+                                if (deadLine.isValid() && deadLine.isBefore(nowMs)) {
+                                    isDelayed = true;
+                                    break;
+                                }
+                            } else {
+                                // Fallback nativo se moment.js não estiver disponível
+                                var dl = new Date(String(activeTask.deadline).replace(' ', 'T'));
+                                if (!isNaN(dl.getTime()) && dl.getTime() < nowMs) {
+                                    isDelayed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        status = isDelayed ? "atrasados" : "andamento";
+                    }
+
+                    // Lista deduplicada de responsáveis ativos
+                    var assigneeIds = [];
+                    for (var t2 = 0; t2 < currentTasks.length; t2++) {
+                        var aid2 = currentTasks[t2].assigneeId;
+                        if (aid2 && assigneeIds.indexOf(aid2) === -1) {
+                            assigneeIds.push(aid2);
+                        }
+                    }
+
+                    data.push({
+                        id: "FLUIG-" + instanceId,
+                        processInstanceId: instanceId,
+                        processId: procId,
+                        processName: procName,
+                        requester: requester,
+                        requesterId: requesterId,
+                        requesterName: requesterName,
+                        date: dateStr,
+                        status: status,
+                        currentActivity: currentActivity,
+                        categoryId: categoryId,
+                        assigneeIds: assigneeIds,
+                        description: "Solicitação gerada para o processo " + procName,
+                        priority: instanceId % 3 === 0 ? "Alta" : (instanceId % 3 === 1 ? "Média" : "Baixa")
+                    });
+                }
+            }
+        } catch (e) {
+            console.error("Erro ao consultar datasets do Fluig:", e);
+        }
+        return data;
+    },
+
+    // Carrega mapa colleagueId → nome amigável a partir do dataset nativo "colleague".
+    // Resolve tanto responsáveis (assigneeIds) quanto solicitantes (requesterId).
+    // Query por ID com constraint (evita carregar todo o dataset de colaboradores).
+    // Falha silenciosa: nome ausente cai para o id como fallback.
+    loadColleagueNames: function() {
+        var instance = this;
+        instance.colleagueMap = {};
+
+        if (typeof DatasetFactory === 'undefined') return;
+
+        // Coleta IDs únicos a resolver: responsáveis + solicitantes
+        var idsNeeded = {};
+        instance.requests.forEach(function(req) {
+            (req.assigneeIds || []).forEach(function(id) {
+                if (id) idsNeeded[id] = true;
+            });
+            if (req.requesterId) idsNeeded[req.requesterId] = true;
+        });
+
+        var ids = Object.keys(idsNeeded);
+        if (ids.length === 0) return;
+
+        ids.forEach(function(id) {
+            try {
+                var c1 = DatasetFactory.createConstraint("colleaguePK.colleagueId", id, id, ConstraintType.MUST);
+                var ds = DatasetFactory.getDataset("colleague", null, [c1], null);
+                if (ds && ds.values && ds.values.length > 0) {
+                    var c = ds.values[0];
+                    instance.colleagueMap[id] = c.colleagueName || c.fullName || id;
+                }
+            } catch (e) {
+                // Silencioso — falha em uma resolução não deve travar o widget
+            }
+        });
+    },
+
+    // Retorna o nome amigável de um usuário.
+    // Ordem: nome do colleague resolvido → rawName fornecido → id → fallback.
+    getUserDisplayName: function(id, rawName) {
+        var instance = this;
+        if (id && instance.colleagueMap[id]) return instance.colleagueMap[id];
+        if (rawName) return rawName;
+        if (id) return id;
+        return 'Solicitante';
+    },
+
+    // Reprocessa instance.requests substituindo o label do solicitante pelo nome amigável.
+    // Chamado após loadColleagueNames(), pois depende do colleagueMap preenchido.
+    resolveRequesterNames: function() {
+        var instance = this;
+        instance.requests.forEach(function(req) {
+            req.requester = instance.getUserDisplayName(req.requesterId, req.requesterName);
+        });
+    },
+
+    // Popula os 3 selects de filtro a partir de instance.requests
+    populateFilters: function() {
+        var instance = this;
+        var root = $('#Central_de_tarefas_' + instance.instanceId);
+
+        // --- SOLICITANTES ---
+        var solicitantes = {};
+        instance.requests.forEach(function(r) {
+            if (r.requester) solicitantes[r.requester] = true;
+        });
+        var solicitantesArr = Object.keys(solicitantes).sort(function(a, b) {
+            return a.localeCompare(b, 'pt-BR');
+        });
+
+        var $solSelect = root.find('#filter-solicitante-' + instance.instanceId);
+        $solSelect.empty();
+        $solSelect.append('<option value="all">Todos</option>');
+        solicitantesArr.forEach(function(s) {
+            $solSelect.append('<option value="' + instance.escapeHtml(s) + '">' + instance.escapeHtml(s) + '</option>');
+        });
+
+        // --- RESPONSÁVEIS ---
+        var responsaveis = {};
+        var hasUnassigned = false;
+        instance.requests.forEach(function(r) {
+            var ids = r.assigneeIds || [];
+            if (ids.length === 0) {
+                hasUnassigned = true;
+            } else {
+                ids.forEach(function(id) {
+                    responsaveis[id] = true;
+                });
+            }
+        });
+        var responsaveisArr = Object.keys(responsaveis).map(function(id) {
+            return { id: id, label: instance.colleagueMap[id] || id };
+        }).sort(function(a, b) {
+            return a.label.localeCompare(b.label, 'pt-BR');
+        });
+
+        var $respSelect = root.find('#filter-responsavel-' + instance.instanceId);
+        $respSelect.empty();
+        $respSelect.append('<option value="all">Todos</option>');
+        responsaveisArr.forEach(function(r) {
+            $respSelect.append('<option value="' + instance.escapeHtml(r.id) + '">' + instance.escapeHtml(r.label) + '</option>');
+        });
+        if (hasUnassigned) {
+            $respSelect.append('<option value="__unassigned__">Não atribuído</option>');
+        }
+
+        // --- CATEGORIAS ---
+        var categorias = {};
+        var hasNoneCategory = false;
+        instance.requests.forEach(function(r) {
+            if (r.categoryId) {
+                categorias[r.categoryId] = true;
+            } else {
+                hasNoneCategory = true;
+            }
+        });
+        var categoriasArr = Object.keys(categorias).sort(function(a, b) {
+            return a.localeCompare(b, 'pt-BR');
+        });
+
+        var $catSelect = root.find('#filter-categoria-' + instance.instanceId);
+        $catSelect.empty();
+        $catSelect.append('<option value="all">Todas</option>');
+        categoriasArr.forEach(function(c) {
+            $catSelect.append('<option value="' + instance.escapeHtml(c) + '">' + instance.escapeHtml(c) + '</option>');
+        });
+        if (hasNoneCategory) {
+            $catSelect.append('<option value="__none__">Sem categoria</option>');
+        }
+
+        instance.updateFiltersBarUI();
+    },
+
+    // Escapa HTML para uso seguro em option values e labels
+    escapeHtml: function(text) {
+        if (text === null || text === undefined) return '';
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    },
+
+    // Retorna lista filtrada por filtros base (solicitante + responsavel + categoria)
+    // SEM mutar instance.requests
+    getFilteredRequests: function() {
+        var instance = this;
+        var f = instance.filters;
+        return instance.requests.filter(function(req) {
+            // Solicitante
+            if (f.solicitante !== 'all') {
+                if ((req.requester || '') !== f.solicitante) return false;
+            }
+            // Responsável
+            if (f.responsavel !== 'all') {
+                var ids = req.assigneeIds || [];
+                if (f.responsavel === '__unassigned__') {
+                    if (ids.length > 0) return false;
+                } else {
+                    if (ids.indexOf(f.responsavel) === -1) return false;
+                }
+            }
+            // Categoria
+            if (f.categoria !== 'all') {
+                if (f.categoria === '__none__') {
+                    if (req.categoryId) return false;
+                } else {
+                    if (req.categoryId !== f.categoria) return false;
+                }
+            }
+            return true;
+        });
+    },
+
+    // Re-renderiza tudo (KPIs, carrossel, kanban) respeitando os filtros atuais.
+    // É lateral change — preserva a busca textual digitada.
+    applyFiltersAndRefresh: function() {
+        var instance = this;
+
+        instance.renderKPIs();
+        instance.updateFiltersBarUI();
+
+        // Se tinha um status selecionado, regenera o carrossel SEM resetar a busca textual
+        if (instance.currentStatus) {
+            instance.selectStatus(instance.currentStatus, { resetSearch: false });
+        }
+    },
+
+    // Mostra/oculta botão "Limpar Filtros" e renderiza chips de filtros ativos
+    updateFiltersBarUI: function() {
+        var instance = this;
+        var root = $('#Central_de_tarefas_' + instance.instanceId);
+        var $btn = $('#clear-filters-' + instance.instanceId);
+        var $chipsContainer = root.find('#active-filters-chips-' + instance.instanceId);
+
+        var chips = [];
+
+        if (instance.filters.solicitante !== 'all') {
+            chips.push({
+                key: 'solicitante',
+                label: 'Solicitante',
+                value: instance.filters.solicitante
+            });
+        }
+        if (instance.filters.responsavel !== 'all') {
+            var respValue = instance.filters.responsavel;
+            var respLabel = respValue === '__unassigned__'
+                ? 'Não atribuído'
+                : (instance.colleagueMap[respValue] || respValue);
+            chips.push({
+                key: 'responsavel',
+                label: 'Responsável',
+                value: respLabel
+            });
+        }
+        if (instance.filters.categoria !== 'all') {
+            var catValue = instance.filters.categoria;
+            var catLabel = catValue === '__none__' ? 'Sem categoria' : catValue;
+            chips.push({
+                key: 'categoria',
+                label: 'Categoria',
+                value: catLabel
+            });
+        }
+        if (instance.currentStatus) {
+            var statusLabels = {
+                andamento: 'Em Andamento',
+                concluidas: 'Concluídas',
+                atrasados: 'Atrasadas',
+                geral: 'Geral'
+            };
+            chips.push({
+                key: 'status',
+                label: 'Status',
+                value: statusLabels[instance.currentStatus] || instance.currentStatus
+            });
+        }
+
+        // Renderiza chips (vazio → CSS esconde via :empty)
+        $chipsContainer.empty();
+        chips.forEach(function(chip) {
+            var chipHtml =
+                '<span class="filter-chip" data-chip-key="' + instance.escapeHtml(chip.key) + '">' +
+                    '<span class="filter-chip-label">' + instance.escapeHtml(chip.label) + ':</span>' +
+                    '<span class="filter-chip-value">' + instance.escapeHtml(chip.value) + '</span>' +
+                    '<button type="button" class="filter-chip-remove" aria-label="Remover filtro ' + instance.escapeHtml(chip.label) + '">&times;</button>' +
+                '</span>';
+            $chipsContainer.append(chipHtml);
+        });
+
+        // Botão Limpar visível se houver pelo menos 1 filtro ativo
+        if (chips.length > 0) {
+            $btn.removeClass('d-none');
+        } else {
+            $btn.addClass('d-none');
+        }
+    },
+
+    // Remove um filtro específico (chamado pelo × do chip)
+    removeFilter: function(key) {
+        var instance = this;
+        var root = $('#Central_de_tarefas_' + instance.instanceId);
+
+        if (key === 'status') {
+            // Remover o status é drilling-out: reseta status + processo + busca textual.
+            // Filtros base (solicitante/responsavel/categoria) permanecem.
+            instance.currentStatus = null;
+            instance.currentProcess = null;
+            instance.carouselIndex = 0;
+            root.find('[data-status-card]').removeClass('active');
+            root.find('#kanban-search-' + instance.instanceId).val('');
+            $('#carousel-section-' + instance.instanceId).addClass('d-none');
+            $('#kanban-section-' + instance.instanceId).addClass('d-none');
+            instance.renderKPIs();
+            instance.updateFiltersBarUI();
+        } else if (instance.filters.hasOwnProperty(key)) {
+            instance.filters[key] = 'all';
+            root.find('#filter-' + key + '-' + instance.instanceId).val('all');
+            instance.applyFiltersAndRefresh();
+        }
+    },
+
+    // Reseta TODOS os filtros e estados, voltando ao carregamento inicial
+    clearAllFilters: function() {
+        var instance = this;
+
+        instance.filters = { solicitante: 'all', responsavel: 'all', categoria: 'all' };
+        instance.currentStatus = null;
+        instance.currentProcess = null;
+        instance.carouselIndex = 0;
+
+        var root = $('#Central_de_tarefas_' + instance.instanceId);
+        root.find('.filter-select').val('all');
+        root.find('#kanban-search-' + instance.instanceId).val('');
+        root.find('[data-status-card]').removeClass('active');
+
+        $('#carousel-section-' + instance.instanceId).addClass('d-none');
+        $('#kanban-section-' + instance.instanceId).addClass('d-none');
+
+        instance.renderKPIs();
+        instance.updateFiltersBarUI();
+    },
+
+    // Renders totals into the status KPI cards
+    renderKPIs: function() {
+        var instance = this;
+        var baseRequests = instance.getFilteredRequests();
+
+        var totals = {
+            andamento: 0,
+            concluidas: 0,
+            atrasados: 0,
+            geral: baseRequests.length
+        };
+
+        baseRequests.forEach(function(req) {
+            if (totals[req.status] !== undefined) {
+                totals[req.status]++;
+            }
+        });
+
+        $('#count-andamento-' + instance.instanceId).text(totals.andamento);
+        $('#count-concluidas-' + instance.instanceId).text(totals.concluidas);
+        $('#count-atrasados-' + instance.instanceId).text(totals.atrasados);
+        $('#count-geral-' + instance.instanceId).text(totals.geral);
+    },
+
+    // Executed when user clicks on a KPI card.
+    // options.resetSearch (default true) — define se a busca textual deve ser limpa.
+    // Click manual em KPI = drill-down novo (resetSearch=true).
+    // Re-render por mudança de filtro base = lateral change (resetSearch=false).
+    selectStatus: function(status, options) {
+        var instance = this;
+        var resetSearch = !options || options.resetSearch !== false;
+        instance.currentStatus = status;
+        instance.carouselIndex = 0;
+
+        // Toggle active visual class on KPI cards
+        var root = $('#Central_de_tarefas_' + instance.instanceId);
+        root.find('[data-status-card]').removeClass('active');
+        root.find('[data-status-card="' + status + '"]').addClass('active');
+
+        // Update Carousel Title
+        var statusLabels = {
+            andamento: 'Em Andamento',
+            concluidas: 'Concluídas',
+            atrasados: 'Atrasadas',
+            geral: 'Gerais (Tudo)'
+        };
+        $('#selected-status-label-' + instance.instanceId).text(statusLabels[status]);
+
+        instance.updateFiltersBarUI();
+
+        // Fonte: requests JÁ filtrados por filtros base
+        var baseRequests = instance.getFilteredRequests();
+
+        // Filter requests based on status
+        var filteredRequests = baseRequests.filter(function(r) {
+            return status === 'geral' || r.status === status;
+        });
+
+        // Group filtered requests by Process
+        var processGroupMap = {};
+        filteredRequests.forEach(function(req) {
+            if (!processGroupMap[req.processId]) {
+                processGroupMap[req.processId] = {
+                    id: req.processId,
+                    name: req.processName,
+                    count: 0
+                };
+            }
+            processGroupMap[req.processId].count++;
+        });
+
+        var processes = [];
+        for (var key in processGroupMap) {
+            if (processGroupMap.hasOwnProperty(key)) {
+                // Progresso usa base filtrada para coerência
+                var totalProcRequests = baseRequests.filter(function(r) { return r.processId === key; });
+                var completedProcRequests = totalProcRequests.filter(function(r) { return r.status === 'concluidas'; });
+                var progressPct = totalProcRequests.length > 0 ? Math.round((completedProcRequests.length / totalProcRequests.length) * 100) : 0;
+
+                var proc = processGroupMap[key];
+                proc.progressPct = progressPct;
+                processes.push(proc);
+            }
+        }
+
+        // Render the Carousel process cards
+        var track = $('#carousel-track-' + instance.instanceId);
+        track.empty();
+        track.css('transform', 'translateX(0px)');
+
+        if (processes.length === 0) {
+            track.append('<div style="padding: 20px; color: var(--text-muted); width: 100%; text-align: center; font-weight: 500;">Nenhum processo encontrado com solicitações nessa situação.</div>');
+            $('#carousel-section-' + instance.instanceId).removeClass('d-none');
+            $('#kanban-section-' + instance.instanceId).addClass('d-none');
+
+            $('#carousel-prev-' + instance.instanceId).prop('disabled', true);
+            $('#carousel-next-' + instance.instanceId).prop('disabled', true);
+            return;
+        }
+
+        processes.forEach(function(proc) {
+            var cardHtml =
+                '<div class="process-card" data-process-id="' + instance.escapeHtml(proc.id) + '">' +
+                    '<div class="process-card-header">' +
+                        '<span class="process-name" title="' + instance.escapeHtml(proc.name) + '">' + instance.escapeHtml(proc.name) + '</span>' +
+                        '<span class="process-count-badge">' + proc.count + '</span>' +
+                    '</div>' +
+                '</div>';
+            track.append(cardHtml);
+        });
+
+        $('#carousel-section-' + instance.instanceId).removeClass('d-none');
+        instance.updateCarouselButtonsState();
+
+        // Tenta preservar o processo selecionado anterior; se não estiver mais disponível, seleciona o primeiro.
+        // resetSearch propaga o que foi decidido em selectStatus (click manual reseta; re-render interno preserva).
+        var prevProcess = instance.currentProcess;
+        var processIds = processes.map(function(p) { return p.id; });
+        if (prevProcess && processIds.indexOf(prevProcess) !== -1) {
+            instance.selectProcess(prevProcess, { resetSearch: resetSearch });
+        } else {
+            instance.selectProcess(processes[0].id, { resetSearch: resetSearch });
+        }
+    },
+
+    // Handles the selection of a process from the carousel track.
+    // options.resetSearch (default true) controla se o input de busca é limpo.
+    // Em re-renders internos (mudança de filtro base) passamos false para preservar a busca.
+    selectProcess: function(processId, options) {
+        var instance = this;
+        var resetSearch = !options || options.resetSearch !== false;
+
+        instance.currentProcess = processId;
+
+        var track = $('#carousel-track-' + instance.instanceId);
+        track.find('.process-card').removeClass('active');
+        track.find('[data-process-id="' + processId + '"]').addClass('active');
+
+        // Busca o nome do processo na lista filtrada (cai para requests originais se não achar)
+        var baseRequests = instance.getFilteredRequests();
+        var processCard = baseRequests.find(function(r) { return r.processId === processId; })
+                       || instance.requests.find(function(r) { return r.processId === processId; });
+        var processName = processCard ? processCard.processName : processId;
+
+        $('#selected-process-label-' + instance.instanceId).text(processName);
+
+        if (resetSearch) {
+            $('#kanban-search-' + instance.instanceId).val('');
+        }
+
+        $('#kanban-section-' + instance.instanceId).removeClass('d-none');
+
+        instance.renderKanban();
+    },
+
+    // Helper to get workflow activity list
+    getProcessActivities: function(processId) {
+        var instance = this;
+        var activities = [];
+
+        // 1. Tenta buscar do Fluig se estiver no ambiente usando o dataset processState
+        if (typeof DatasetFactory !== 'undefined' && typeof WCMAPI !== 'undefined') {
+            try {
+                var constraints = [];
+                constraints.push(DatasetFactory.createConstraint("processStatePK.processId", processId, processId, ConstraintType.MUST));
+
+                var companyId = WCMAPI.getCompanyId ? WCMAPI.getCompanyId() : (WCMAPI.organizationId || "1");
+                constraints.push(DatasetFactory.createConstraint("processStatePK.companyId", companyId, companyId, ConstraintType.MUST));
+                constraints.push(DatasetFactory.createConstraint("automatic", false, false, ConstraintType.MUST));
+
+                var dsProcessState = DatasetFactory.getDataset("processState", null, constraints, null);
+
+                if (dsProcessState && dsProcessState.values && dsProcessState.values.length > 0) {
+                    var values = dsProcessState.values.slice();
+
+                    values.sort(function(a, b) {
+                        var seqA = parseInt(a["processStatePK.sequence"] || a.sequence || 0);
+                        var seqB = parseInt(b["processStatePK.sequence"] || b.sequence || 0);
+                        return seqA - seqB;
+                    });
+
+                    var seen = {};
+                    values.forEach(function(row) {
+                        var desc = row.stateName || row.stateDescription;
+                        var seq = parseInt(row["processStatePK.sequence"] || row.sequence || 0);
+
+                        if (desc && desc.trim() !== "" && seq > 0) {
+                            var normalizedDesc = desc.trim().toUpperCase();
+                            if (!seen[normalizedDesc]) {
+                                seen[normalizedDesc] = true;
+                                activities.push(desc.trim());
+                            }
+                        }
+                    });
+                }
+            } catch (e) {
+                console.error("Erro ao buscar atividades via dataset processState:", e);
+            }
+        }
+
+        // 2. Fallback estático (vazio hoje)
+        if (activities.length === 0) {
+            var maps = {};
+            activities = maps[processId] || [];
+        }
+
+        // 3. Fallback dinâmico: varre solicitações históricas (usa requests originais, não filtradas — atividades do processo são propriedade dele, não do filtro)
+        if (activities.length === 0) {
+            var acts = [];
+            var allProcessRequests = instance.requests.filter(function(r) {
+                return r.processId === processId;
+            });
+            var seenFallback = {};
+            allProcessRequests.forEach(function(r) {
+                if (r.currentActivity) {
+                    var normalizedDesc = r.currentActivity.trim().toUpperCase();
+                    if (!seenFallback[normalizedDesc]) {
+                        seenFallback[normalizedDesc] = true;
+                        acts.push(r.currentActivity.trim());
+                    }
+                }
+            });
+            activities = acts;
+        }
+
+        return activities;
+    },
+
+    // Renders the Kanban Board columns and inserts filtered request cards
+    renderKanban: function() {
+        var instance = this;
+        var processId = instance.currentProcess;
+        var status = instance.currentStatus;
+
+        var board = $('#kanban-board-' + instance.instanceId);
+        board.empty();
+
+        if (!processId) return;
+
+        // Fonte: requests JÁ filtrados por filtros base
+        var baseRequests = instance.getFilteredRequests();
+
+        // Filter requests by current selected process
+        var processRequests = baseRequests.filter(function(r) {
+            return r.processId === processId;
+        });
+
+        // Filter requests further based on the selected Status
+        var statusRequests = processRequests.filter(function(r) {
+            return status === 'geral' || !status || r.status === status;
+        });
+
+        // Apply real-time text Search Filter
+        var searchQuery = $('#kanban-search-' + instance.instanceId).val();
+        var finalRequests = statusRequests;
+        if (searchQuery && searchQuery.trim() !== '') {
+            var q = searchQuery.toLowerCase().trim();
+            finalRequests = statusRequests.filter(function(r) {
+                return r.id.toLowerCase().indexOf(q) !== -1 ||
+                       (r.requester || '').toLowerCase().indexOf(q) !== -1 ||
+                       (r.description || '').toLowerCase().indexOf(q) !== -1;
+            });
+        }
+
+        // Update total counter in Kanban badge
+        $('#kanban-total-requests-' + instance.instanceId).text(finalRequests.length + (finalRequests.length === 1 ? ' solicitação' : ' solicitações'));
+
+        // Retrieve the ordered workflow activities for this process
+        var activities = instance.getProcessActivities(processId);
+
+        if (activities.length === 0) {
+            board.append('<div style="padding: 20px; color: var(--text-muted); width: 100%; text-align: center;">Nenhuma atividade definida para este processo.</div>');
+            return;
+        }
+
+        // Generate columns for each activity
+        activities.forEach(function(activity) {
+            var activityRequests = finalRequests.filter(function(req) {
+                var reqAct = (req.currentActivity || "").trim().toUpperCase();
+                var colAct = activity.trim().toUpperCase();
+
+                if (reqAct === colAct) {
+                    return true;
+                }
+                var isLastActivity = (activities.indexOf(activity) === activities.length - 1);
+                if (isLastActivity && req.status === "concluidas") {
+                    var matchesOther = activities.some(function(act) {
+                        var otherColAct = act.trim().toUpperCase();
+                        return act !== activity && reqAct === otherColAct;
+                    });
+                    return !matchesOther;
+                }
+                return false;
+            });
+
+            var colId = 'kanban-col-' + instance.instanceId + '-' + activity.replace(/\s+/g, '-');
+            var colHtml =
+                '<div class="kanban-column" id="' + colId + '">' +
+                    '<div class="column-header">' +
+                        '<span class="column-title" title="' + instance.escapeHtml(activity) + '">' + instance.escapeHtml(activity) + '</span>' +
+                        '<span class="column-badge">' + activityRequests.length + '</span>' +
+                    '</div>' +
+                    '<div class="column-cards-container">';
+
+            if (activityRequests.length === 0) {
+                colHtml += '<div style="font-size: 11px; color: var(--text-muted); text-align: center; padding: 16px 0; border: 1px dashed var(--border-color); border-radius: var(--radius-sm); background-color: var(--bg-card);">Nenhuma solicitação</div>';
+            } else {
+                activityRequests.forEach(function(req) {
+                    var prioClass = 'priority-' + (req.priority || '').toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                    // Padroniza para singular (CSS usa .status-andamento, .status-concluido, .status-atrasado)
+                    var statusKeyMap = { 'concluidas': 'concluido', 'atrasados': 'atrasado' };
+                    var statusClass = 'status-' + (statusKeyMap[req.status] || req.status);
+                    var isAtrasado = req.status === 'atrasados';
+
+                    // Respons\u00e1vel: resolve nome amig\u00e1vel do primeiro assignee (se houver)
+                    var respId = (req.assigneeIds && req.assigneeIds.length > 0) ? req.assigneeIds[0] : null;
+                    var respName = respId ? instance.getUserDisplayName(respId, null) : 'N\u00e3o atribu\u00eddo';
+                    var respExtra = (req.assigneeIds && req.assigneeIds.length > 1)
+                        ? ' +' + (req.assigneeIds.length - 1) : '';
+
+                    colHtml +=
+                        '<div class="kanban-card kanban-card-clickable ' + statusClass + '" ' +
+                            'data-process-instance="' + instance.escapeHtml(req.processInstanceId) + '" ' +
+                            'data-process-id="' + instance.escapeHtml(req.processId) + '" ' +
+                            'tabindex="0" role="button" ' +
+                            'title="Abrir solicita\u00e7\u00e3o ' + instance.escapeHtml(req.id) + ' em nova aba">' +
+	                            '<div class="card-header-info">' +
+	                                '<span class="card-id">' +
+	                                    instance.escapeHtml(req.id) +
+	                                '</span>' +
+                                '<span class="card-date">' + instance.escapeHtml(req.date) + '</span>' +
+                            '</div>' +
+                            (isAtrasado
+                                ? '<span class="card-atraso-badge">' +
+                                      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="card-atraso-icon">' +
+                                          '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>' +
+                                          '<line x1="12" y1="9" x2="12" y2="13"></line>' +
+                                          '<line x1="12" y1="17" x2="12.01" y2="17"></line>' +
+                                      '</svg>ATRASADO</span>'
+                                : '') +
+                            '<p class="card-description">' + instance.escapeHtml(req.description) + '</p>' +
+                            '<div class="card-assignee" title="Respons\u00e1vel: ' + instance.escapeHtml(respName) + respExtra + '">' +
+                                '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="card-assignee-icon">' +
+                                    '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>' +
+                                    '<circle cx="12" cy="7" r="4"></circle>' +
+                                '</svg>' +
+                                '<span class="card-assignee-name">' + instance.escapeHtml(respName) + respExtra + '</span>' +
+                            '</div>' +
+                            '<div class="card-footer-info">' +
+                                '<span class="card-requester" title="Solicitante: ' + instance.escapeHtml(req.requester) + '">' + instance.escapeHtml(req.requester) + '</span>' +
+                                '<span class="priority-badge ' + prioClass + '">' + instance.escapeHtml(req.priority) + '</span>' +
+                            '</div>' +
+                        '</div>';
+                });
+            }
+
+            colHtml += '</div></div>';
+            board.append(colHtml);
+        });
+    },
+
+    // Slides the carousel track horizontally
+    slideCarousel: function(direction) {
+        var instance = this;
+        var track = $('#carousel-track-' + instance.instanceId);
+        var cards = track.find('.process-card');
+        if (cards.length === 0) return;
+
+        var containerWidth = $('.carousel-track-container').width();
+        var cardWidth = cards.first().outerWidth(true);
+
+        var visibleCount = Math.floor(containerWidth / cardWidth) || 1;
+        var maxIndex = Math.max(0, cards.length - visibleCount);
+
+        if (direction === 'next') {
+            instance.carouselIndex = Math.min(instance.carouselIndex + 1, maxIndex);
+        } else {
+            instance.carouselIndex = Math.max(instance.carouselIndex - 1, 0);
+        }
+
+        var translateValue = -(instance.carouselIndex * cardWidth);
+        track.css('transform', 'translateX(' + translateValue + 'px)');
+
+        instance.updateCarouselButtonsState();
+    },
+
+    // Updates disabled state of carousel buttons
+    updateCarouselButtonsState: function() {
+        var instance = this;
+        var track = $('#carousel-track-' + instance.instanceId);
+        var cards = track.find('.process-card');
+
+        if (cards.length === 0) {
+            $('#carousel-prev-' + instance.instanceId).prop('disabled', true);
+            $('#carousel-next-' + instance.instanceId).prop('disabled', true);
+            return;
+        }
+
+        var containerWidth = $('.carousel-track-container').width();
+        var cardWidth = cards.first().outerWidth(true) || 280;
+
+        var visibleCount = Math.floor(containerWidth / cardWidth) || 1;
+        var maxIndex = Math.max(0, cards.length - visibleCount);
+
+        $('#carousel-prev-' + instance.instanceId).prop('disabled', instance.carouselIndex === 0);
+        $('#carousel-next-' + instance.instanceId).prop('disabled', instance.carouselIndex >= maxIndex);
+    }
+});
