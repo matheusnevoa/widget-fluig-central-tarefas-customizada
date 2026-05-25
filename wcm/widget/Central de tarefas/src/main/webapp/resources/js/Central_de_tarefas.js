@@ -94,6 +94,16 @@ var Central_de_tarefas = SuperWidget.extend({
         // Decide se mostra estado vazio inicial (vazio legítimo, erro de load ou sem ambiente)
         instance.renderEmptyState();
 
+        // === DIAG TEMPORÁRIO (remover após investigação) ===
+        var _diagSample = (instance.requests || [])[0];
+        console.log('[CentralTarefas][diag] init END instanceId=' + instance.instanceId
+            + ' requests=' + (instance.requests || []).length
+            + ' colleagueMapKeys=' + Object.keys(instance.colleagueMap || {}).length,
+            'sample.requester=', _diagSample && _diagSample.requester,
+            'sample.requesterId=', _diagSample && _diagSample.requesterId,
+            'sample.requesterName=', _diagSample && _diagSample.requesterName);
+        // === FIM DIAG ===
+
         if (instance.debugPerf) {
             console.log('[CentralTarefas][perf] init: ' + Math.round(instance._perfNow() - _initT0) + 'ms');
             instance._perfReport('init');
@@ -615,18 +625,33 @@ var Central_de_tarefas = SuperWidget.extend({
             }
         });
         var residual = Object.keys(residualIds);
+        // === DIAG TEMPORÁRIO (remover após investigação) ===
+        console.log('[CentralTarefas][diag] requests.length=' + instance.requests.length
+            + ' assignees=' + ids.length
+            + ' residualRequesterIds=' + residual.length, residual);
+        // === FIM DIAG ===
         if (residual.length > 0) {
             residual.forEach(function(id) {
                 try {
                     var c1 = DatasetFactory.createConstraint("colleaguePK.colleagueId", id, id, ConstraintType.MUST);
                     instance._perfCount('dataset.colleague.requester');
                     var ds = DatasetFactory.getDataset("colleague", null, [c1], null);
+                    // === DIAG TEMPORÁRIO ===
+                    var rowsLen = (ds && ds.values) ? ds.values.length : 0;
+                    var firstName = rowsLen ? (ds.values[0].colleagueName || ds.values[0].fullName || '(sem nome)') : '(sem rows)';
+                    console.log('[CentralTarefas][diag] residual id=' + id + ' rows=' + rowsLen + ' name=' + firstName);
+                    // === FIM DIAG ===
                     if (ds && ds.values && ds.values.length > 0) {
                         var c = ds.values[0];
                         instance.colleagueMap[id] = c.colleagueName || c.fullName || id;
                     }
-                } catch (e) { /* silencioso */ }
+                } catch (e) {
+                    console.log('[CentralTarefas][diag] residual ERROR id=' + id, e && e.message);
+                }
             });
+            // === DIAG TEMPORÁRIO ===
+            console.log('[CentralTarefas][diag] colleagueMap após residual:', JSON.stringify(instance.colleagueMap));
+            // === FIM DIAG ===
         }
     },
 
